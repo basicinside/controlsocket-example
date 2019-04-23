@@ -3,78 +3,145 @@
 """
 Tornado control socket example.
 
-`telnet localhost 9999' connects to the controlsocket.
-`http://localhost:8888` shows the welcome message `Hello World`
+`telnet localhost 9090' connects to the controlsocket.
+`http://localhost:8080` shows the welcome message `Hello World!`
 
-Use can manipulate the web output interactively from the control
+In this example you can alter the web output interactively from the control
 socket. Send `hello <name>` to the control socket to alter the
 web pages welcome message. Send `quit` to disconnect.
 This can be used to i.e. modify log levels in a running process
-without rebooting or changing other internal configuring states
+without rebooting or changing other internal configuration state
 on demand.
 """
-import tornado.web
-from tornado.ioloop import IOLoop
-from tornado.tcpserver import TCPServer
+import argparse
+import logging
+import re
 import socket
 
-__author__ = "Robin Kuck (@basicinside)"
-__copyright__ = "Copyright 2015"
-__credits__ = ["Robin Kuck"]
-__license__ = "GPL"
-__version__ = "0.1"
-__maintainer__ = "Robin Kuck"
-__email__ = "robin@basicinside.de"
-__status__ = "Draft"
+import coloredlogs
+import tornado.web
+from tornado.ioloop import IOLoop
+from tornado.iostream import StreamClosedError
+from tornado.tcpserver import TCPServer
 
-name = "World"
+PARAMS_COMMAND_PATTERN = re.compile('^(?P<command>[\\w-]+) (?P<params>.*)$')
+SINGLE_COMMAND_PATTERN = re.compile('^(?P<command>[\\w-]+)$')
+
+logger = logging.getLogger(__name__)
+# XXX: argparse loglevel
+coloredlogs.install(level='DEBUG')
+
+
+class AppState(object):
+    def __init__(self, name):
+        self.name = name
+
+
+class QuitSignal(Exception):
+    pass
 
 
 class MainHandler(tornado.web.RequestHandler):
     """
     Welcome message web handler
     """
+    def initialize(self, state):
+        self.state = state
+
     def get(self):
-        self.write("Hello {}!".format(name))
+        self.write("Hello {}!".format(self.state.name))
 
 
 class ControlSocket(TCPServer):
     """
     Control socket based on tornados TCPServer
     """
-    def handle_stream(self, stream, address):
-        self._stream = stream
-        self._address = address
-        self._read_line()
+    def __init__(self, *args, state=None, **kwargs):
+        self.state = state
+        super().__init__(*args, **kwargs)
 
-    def _read_line(self):
-        self._stream.read_until('\n', self._handle_read)
+    async def handle_stream(self, stream, address):
+        self.stream = stream
+        addr = '{}:{}'.format(address[0], address[1])
+        logger.debug('Incoming connection from {}'.format(addr))
+        while True:
+            try:
+                line = await self.stream.read_until(b'\n')
+                await self.handle_readline(line.decode('utf-8').strip())
+            except StreamClosedError:
+                break
+            except QuitSignal:
+                break
+        logger.debug('Connection from {} closed'.format(addr))
 
-    def _handle_read(self, command):
-        global name
-        arguments = command.strip().split(' ', 1)
-        command = arguments[0]
-        try:
-            params = arguments[1]
-        except:
-            params = None
-        if command == 'hello':
-            name = params
-        elif command == 'quit':
-            self._stream.socket.shutdown(socket.SHUT_RDWR)
-            self._stream.close()
-            return
+    async def write_stream(self, message):
+        await self.stream.write(bytearray(message, 'utf-8'))
+
+    async def handle_readline(self, line):
+        params_match = PARAMS_COMMAND_PATTERN.match(line)
+        single_match = SINGLE_COMMAND_PATTERN.match(line)
+
+        if params_match:
+            command = params_match.group('command')
+            params = params_match.group('params')
+
+            if command == 'hello':
+                self.state.name = params
+            else:
+                response = "command '{}' with params '{}' not found\n".format(
+                        command, params)
+                logger.warning(response)
+                await self.write_stream(response)
+        elif single_match:
+            command = single_match.group('command')
+
+            if command == 'quit':
+                await self.write_stream("Goodbye!\n")
+                self.stream.socket.shutdown(socket.SHUT_RDWR)
+                self.stream.close()
+                raise QuitSignal()
+            else:
+                response = "command '{}' not found\n".format(command)
+                logger.warning(response)
+                await self.write_stream(response)
         else:
-            response = "command '{}' not found\n".format(command)
-            self._stream.write(response)
-        self._read_line()
+            response = "invalid input: '{}'\n".format(line)
+            logger.warning(response)
+            await self.write_stream(response)
+
+
+class ControlSocketApplication(object):
+    def __init__(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+                '--web-port', type=int, default=8080, help='web server port')
+        parser.add_argument(
+                '--controlsocket-port', default=9090, type=int,
+                help='controlsocket port')
+        self.args = parser.parse_args()
+
+        self.state = AppState('World')
+
+        self.application = tornado.web.Application([
+            (r"/", MainHandler, dict(state=self.state)),
+        ])
+
+        self.controlsocket = ControlSocket(state=self.state)
+
+    def execute(self):
+        logger.info('Spawning controlsocket on localhost:{}'.format(
+            self.args.controlsocket_port))
+        self.controlsocket.listen(self.args.controlsocket_port)
+        logger.info('Spawning web server on localhost:{}'.format(
+            self.args.web_port))
+        self.application.listen(self.args.web_port)
+        IOLoop.instance().start()
+
+
+def main():
+    app = ControlSocketApplication()
+    app.execute()
 
 
 if __name__ == "__main__":
-    application = tornado.web.Application([
-        (r"/", MainHandler),
-    ])
-    application.listen(8888)
-    controlsocket = ControlSocket()
-    controlsocket.listen(9999)
-    IOLoop.instance().start()
+    main()
